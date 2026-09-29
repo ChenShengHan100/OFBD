@@ -1,0 +1,969 @@
+import argparse
+import os
+import random
+import shutil
+import time
+import warnings
+import math
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
+import torchvision.models as models_office
+import csv
+from torch.utils.data import DataLoader
+from torchvision.transforms import transforms
+from dataset.cifar import IMBALANCECIFAR10
+from dataset.cifar import IMBALANCECIFAR100
+from dataset.imagenet import ImageNetLT
+from dataset.inaturalist import INaturalist
+from dataset.PlacesLT import PlacesLT
+from loss.contrastive import OFBDContrastiveLoss
+from loss.logitadjust import OFBDLogitAdjustLoss, OFBDCutMixLoss
+from models.resnet32 import OFBDModel32
+from models.resnext import OFBDModel
+from utils import rand_augment_transform
+from utils import shot_acc, GaussianBlur
+from utils import CIFAR10Policy
+from concurrent.futures import ThreadPoolExecutor
+from models.ofbd_mixup import OFBDMixupModule
+from models.paper_prior_rl import FeatureProposalSelector
+from models.multibox_k_cutmix import EnergyPriorMultiBoxHelper
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset', default='imagenet', choices=['inat', 'imagenet', 'cifar10', 'cifar100','Places_LT'])
+parser.add_argument('--data', default='./dataset', metavar='DIR')
+parser.add_argument('--arch', default='resnext50', choices=['resnet50', 'resnext50', 'resnet32', 'resnet152' ,'resnext101'])
+parser.add_argument('--workers', default=12, type=int)
+parser.add_argument('--epochs', default=90, type=int)
+parser.add_argument('--temp', default=0.07, type=float, help='scalar temperature for contrastive learning')
+parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=256, type=int,
+                    metavar='N',
+                    help='mini-batch size (default: 256), this is the total '
+                         'batch size of all GPUs on the current node when '
+                         'using Data Parallel or Distributed Data Parallel')
+parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr')
+parser.add_argument('--schedule', default=[160, 180], nargs='*', type=int,
+                    help='learning rate schedule (when to drop lr by 10x)')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum of SGD solver')
+parser.add_argument('--wd', '--weight-decay', default=5e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)',
+                    dest='weight_decay')
+parser.add_argument('-p', '--print-freq', default=20, type=int,
+                    metavar='N', help='print frequency (default: 20)')
+parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
+                    help='evaluate model on validation set')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--gpu', default=None, type=int,
+                    help='GPU id to use.')
+parser.add_argument('--alpha', default=1.0, type=float, help='cross entropy loss weight')
+parser.add_argument('--beta', default=0.35, type=float, help='supervised contrastive loss weight')
+parser.add_argument('--randaug', default=True, type=bool, help='use RandAugmentation for classification branch')
+parser.add_argument('--cl_views', default='sim-sim', type=str,
+                    choices=['sim-sim', 'sim-rand', 'rand-rand', 'cutout-sim', 'none-sim', "cutout-none",
+                             "uncutout-sim", "unauto-sim", "cutmix-sim", "cutoutmix-sim", "uncutout-cutmix_sim"],
+                    help='Augmentation strategy for contrastive learning views')
+parser.add_argument('--feat_dim', default=1024, type=int, help='feature dimension of mlp head')
+parser.add_argument('--warmup_epochs', default=0, type=int,
+                    help='warmup epochs')
+parser.add_argument('--root_log', type=str, default='log')
+parser.add_argument('--cos', default=False, action='store_true',
+                    help='lr decays by cosine scheduler. ')
+parser.add_argument('--use_norm', action='store_true',
+                    help='cosine classifier.')
+parser.add_argument('--randaug_m', default=10, type=int, help='randaug-m')
+parser.add_argument('--randaug_n', default=2, type=int, help='randaug-n')
+parser.add_argument('--seed', default=None, type=int, help='seed for initializing training')
+parser.add_argument('--reload', default=False, type=bool, help='load supervised model')
+parser.add_argument('--imb_factor', default=1, type=float)
+parser.add_argument('--grad_c', action='store_true', )
+parser.add_argument('--file_name', default="", type=str)
+parser.add_argument('--device_ids', default=[0], type=int, nargs="*")
+parser.add_argument('--save_epoch', default=None, type=int)
+parser.add_argument('--auto_resume', action='store_true')
+parser.add_argument('--reload_torch', default=None, type=str,
+                    help='load supervised model from torchvision')
+parser.add_argument('--num_classes', default=None, type=int,
+                    help='num_classes')
+# neptune
+parser.add_argument('--logger', default="none", type=str, choices=["neptune", "none"])
+parser.add_argument('--ne_token', default="", type=str)
+parser.add_argument('--ne_project', default="", type=str)
+parser.add_argument('--ne_run', default=None, type=str)
+
+
+# ablation
+parser.add_argument('--Background_sampler', default="uniform", type=str, choices=["balance", "reverse", "uniform"])
+parser.add_argument('--Foreground_sampler', default="balance", type=str, choices=["reverse", "balance", "uniform"])
+
+# cutmix:
+
+parser.add_argument('--cutmix_prob', default=0.5, type=float,
+                    help='cutmix probability')
+
+
+# OFBD contrastive CutMix
+parser.add_argument('--l_d_warm', default=0, type=int)
+parser.add_argument('--scaling_factor', default=[2, 256], nargs='*', type=int,
+                    help='scaling_factor=[a,b]=a/b')
+parser.add_argument('--tau', default=1, type=float)
+parser.add_argument('--topk', default=1, type=int)
+
+
+parser.add_argument('--fft_k', default=32, type=int, help='保留特征图中前 k 个稳定的背景块 (总共64块)')
+parser.add_argument('--sigma', default=8.0, type=float, help='高斯低通滤波的平滑度 (默认 8.0)')
+parser.add_argument('--paper_rl_prob', default=0.01, type=float)
+parser.add_argument('--paper_rl_warmup_epochs', default=30, type=int)
+parser.add_argument('--paper_rl_m', default=4, type=int)
+parser.add_argument('--paper_rl_k', default=2, type=int)
+parser.add_argument('--paper_rl_energy_weight', default=10.0, type=float)
+parser.add_argument('--paper_rl_residual_weight', default=0.01, type=float)
+parser.add_argument('--paper_rl_lr', default=3e-4, type=float)
+parser.add_argument('--paper_rl_kl', default=0.02, type=float)
+parser.add_argument('--paper_selector_arch', default='lite', choices=['lite', 'shufflenetv2_x0_5', 'mobilenetv3_small'])
+
+def main():
+
+
+
+
+
+    args = parser.parse_args()
+    if args.num_classes is None:
+        args.num_classes = {
+            'cifar10': 10, 'cifar100': 100, 'imagenet': 1000,
+            'Places_LT': 365, 'inat': 8142,
+        }[args.dataset]
+
+    # 如果没有手动指定 seed，就自动随机生成一个
+    if args.seed is None:
+        args.seed = random.SystemRandom().randint(0, 2**32 - 1)
+
+    print(f"Using seed: {args.seed}")
+
+    random.seed(args.seed)
+    os.environ['PYTHONHASHSEED'] = str(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
+    cudnn.deterministic = True
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    warnings.warn(
+        'You have chosen to seed training. '
+        'This will turn on the CUDNN deterministic setting, '
+        'which can slow down your training considerably! '
+        'You may see unexpected behavior when restarting '
+        'from checkpoints.'
+    )
+
+    args.store_name = '_'.join(
+        [args.file_name, args.dataset, args.arch,
+        'batchsize', str(args.batch_size),
+        'epochs', str(args.epochs),
+        'temp', str(args.temp),
+        'cutmix_prob', str(args.cutmix_prob),
+        'topk', str(args.topk),
+        'scaling_factor', str(args.scaling_factor[0]), str(args.scaling_factor[1]),
+        'tau', str(args.tau),
+        'lr', str(args.lr),
+        args.cl_views,
+        'fftk', str(args.fft_k),
+        'sigma', str(args.sigma),
+        'seed', str(args.seed)]
+    )
+
+    print(args.store_name)
+
+
+    if args.gpu is not None:
+        warnings.warn('You have chosen a specific GPU. This will completely '
+                      'disable data parallelism.')
+
+
+    ngpus_per_node = torch.cuda.device_count()
+    main_worker(args.gpu, ngpus_per_node, args)
+
+
+def main_worker(gpu, ngpus_per_node, args):
+    logger_run = None
+    print(args.logger)
+    if (args.logger == "neptune"):
+        import neptune
+
+        if (args.ne_run != None):
+
+            logger_run = neptune.init_run(with_id=args.ne_run,project=args.ne_project,
+                                      api_token=args.ne_token,
+                                     description=args.file_name)
+        else:
+            logger_run = neptune.init_run(project=args.ne_project,
+                                      api_token=args.ne_token,
+                                      description=args.file_name
+                                      )
+
+        logger_run["dataset"] = args.dataset
+        logger_run["arch"] = args.arch
+        logger_run["epoch"] = args.epochs
+        logger_run["scaling_factor"] = args.scaling_factor
+        logger_run["l_d_warm"] = args.l_d_warm
+        logger_run["topk"] = args.topk
+        logger_run["prob"] = args.cutmix_prob
+        logger_run["args"] = args
+        logger_run["tau"] = args.tau
+
+
+
+    args.gpu = gpu
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
+
+    # create model
+    print("=> creating model '{}'".format(args.arch))
+
+
+    if args.arch == 'resnet50':
+        model = OFBDModel(name='resnet50', feat_dim=args.feat_dim,
+                                 num_classes=args.num_classes ,
+
+                                 use_norm=args.use_norm)
+    elif args.arch == 'resnext50':
+        model = OFBDModel(name='resnext50', feat_dim=args.feat_dim,num_classes=args.num_classes,
+                                 use_norm=args.use_norm, fft_k=args.fft_k, sigma=args.sigma)
+    elif args.arch == 'resnet32':
+
+        model = OFBDModel32(name='resnet32', feat_dim=args.feat_dim,
+                                   num_classes=args.num_classes,
+                                   use_norm=args.use_norm)
+    elif args.arch =="resnet152":
+        model = OFBDModel(name='resnet152', feat_dim=args.feat_dim,
+                                 num_classes=args.num_classes ,
+                                 use_norm=args.use_norm, fft_k=args.fft_k, sigma=args.sigma)
+    elif args.arch == 'resnext101':
+        model = OFBDModel(name='resnext101', feat_dim=args.feat_dim,
+                                 num_classes=args.num_classes ,
+                                 use_norm=args.use_norm, fft_k=args.fft_k, sigma=args.sigma)
+    else:
+        raise NotImplementedError('This model is not supported')
+    # print(model)
+
+
+
+    if args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        model = model.cuda(args.gpu)
+    else:
+        model = torch.nn.DataParallel(model, device_ids=args.device_ids).cuda()
+
+    # model = torch.nn.DataParallel(model).cuda()
+    # model = model.cuda()
+
+    if not 1 <= args.paper_rl_k <= args.paper_rl_m:
+        raise ValueError('--paper_rl_k must be in [1, paper_rl_m]')
+    global paper_selector, paper_selector_ref, paper_helper, paper_selector_optimizer
+    paper_selector = paper_selector_ref = paper_helper = paper_selector_optimizer = None
+    if args.paper_rl_prob > 0:
+        # Preserve classifier RNG state: adding the selector must not change the
+        # Preserve the local-energy branch's initialization and augmentation RNG.
+        cpu_rng, cuda_rng = torch.get_rng_state(), torch.cuda.get_rng_state()
+        in_channels = 2048 if args.arch in ('resnet50', 'resnext50', 'resnet152', 'resnext101') else 64
+        paper_selector = FeatureProposalSelector(in_channels=in_channels, base_channels=32,
+                                                 arch=args.paper_selector_arch).cuda(args.gpu)
+        paper_selector_ref = FeatureProposalSelector(in_channels=in_channels, base_channels=32,
+                                                     arch=args.paper_selector_arch).cuda(args.gpu)
+        paper_selector_ref.load_state_dict(paper_selector.state_dict())
+        paper_selector_ref.eval()
+        for parameter in paper_selector_ref.parameters():
+            parameter.requires_grad_(False)
+        paper_helper = EnergyPriorMultiBoxHelper(
+            top_m=args.paper_rl_m, num_selected=args.paper_rl_k, min_scale=.15, max_scale=.55,
+            kl_weight=args.paper_rl_kl, energy_prior_weight=args.paper_rl_energy_weight,
+            residual_weight=args.paper_rl_residual_weight)
+        paper_selector_optimizer = torch.optim.AdamW(paper_selector.parameters(), lr=args.paper_rl_lr,
+                                                      weight_decay=args.weight_decay)
+        torch.set_rng_state(cpu_rng)
+        torch.cuda.set_rng_state(cuda_rng)
+    optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    best_acc1 = 0.0
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            checkpoint = torch.load(args.resume, map_location='cuda:0')
+            args.start_epoch = checkpoint['epoch']
+            best_acc1 = checkpoint['best_acc1']
+            if args.gpu is not None:
+                # best_acc1 may be from a checkpoint from a different GPU
+                best_acc1 = best_acc1.to(args.gpu)
+            model.load_state_dict(checkpoint['state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+            print("best_acc1",best_acc1)
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+    elif args.auto_resume:
+            filename = os.path.join(args.root_log, args.store_name, 'OFBD_ckpt.pth.tar')
+            if os.path.isfile(filename):
+                print("=> auto loading checkpoint '{}'".format(filename))
+                checkpoint = torch.load(filename, map_location='cuda:0')
+                args.start_epoch = checkpoint['epoch']
+                best_acc1 = checkpoint['best_acc1']
+                print("best_acc1",best_acc1)
+                if args.gpu is not None:
+                    # best_acc1 may be from a checkpoint from a different GPU
+                    best_acc1 = best_acc1.to(args.gpu)
+                model.load_state_dict(checkpoint['state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                print("=> loaded checkpoint '{}' (epoch {})"
+                      .format(filename, checkpoint['epoch']))
+            else:
+                print("=> no auto checkpoint found at '{}'".format(filename))
+    elif args.reload_torch:
+            state_dict = model.state_dict()
+            state_dict_imagenet = torch.load(args.reload_torch)
+            for key in state_dict.keys():
+                    newkey = key[8:]
+                    if newkey in state_dict_imagenet.keys() and state_dict[key].shape == state_dict_imagenet[newkey].shape:
+                        state_dict[key]=state_dict_imagenet[newkey]
+                        print(newkey+" ****loaded******* ")
+                    else:
+                        print(key+" ****unloaded******* ")
+            model.load_state_dict(state_dict)
+    # cudnn.benchmark = True
+
+    normalize = transforms.Normalize((0.466, 0.471, 0.380), (0.195, 0.194, 0.192)) if args.dataset == 'inat' \
+        else transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
+    rgb_mean = (0.485, 0.456, 0.406)
+    ra_params = dict(translate_const=int(224 * 0.45), img_mean=tuple([min(255, round(255 * x)) for x in rgb_mean]), )
+    os.makedirs(os.path.join(args.root_log, args.store_name), exist_ok=True)
+
+    augmentation_randnclsstack = [
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        rand_augment_transform('rand-n{}-m{}-mstd0.5'.format(args.randaug_n, args.randaug_m), ra_params),
+        transforms.ToTensor(),
+        normalize,
+    ]
+    augmentation_sim = [
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.ToTensor(),
+        normalize
+    ]
+    augmentation_sim_cifar = [
+        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        ], p=0.8),
+        transforms.RandomGrayscale(p=0.2),
+        transforms.RandomApply([GaussianBlur([.1, 2.])], p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ]
+    Uncut_augmentation_regular = [
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        CIFAR10Policy(),  # add AutoAug
+        transforms.ToTensor(),
+        transforms.Normalize(
+            (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ]
+    augmentation_randncls = [
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomApply([
+            transforms.ColorJitter(0.4, 0.4, 0.4, 0.0)
+        ], p=1.0),
+        rand_augment_transform('rand-n{}-m{}-mstd0.5'.format(args.randaug_n, args.randaug_m), ra_params),
+        transforms.ToTensor(),
+        normalize,
+    ]
+
+    if args.cl_views == 'sim-sim':
+        transform_train = [transforms.Compose(augmentation_randncls), transforms.Compose(augmentation_sim),
+                           transforms.Compose(augmentation_sim), ]
+    elif args.cl_views == 'sim-rand':
+        transform_train = [transforms.Compose(augmentation_randncls), transforms.Compose(augmentation_randnclsstack),
+                           transforms.Compose(augmentation_sim), ]
+    elif args.cl_views == 'randstack-randstack':
+        transform_train = [transforms.Compose(augmentation_randncls), transforms.Compose(augmentation_randnclsstack),
+                           transforms.Compose(augmentation_randnclsstack), ]
+    elif args.cl_views == "uncutout-sim":
+        transform_train = [transforms.Compose(Uncut_augmentation_regular), transforms.Compose(augmentation_sim_cifar),
+                           transforms.Compose(augmentation_sim_cifar), ]
+    else:
+        raise NotImplementedError("This augmentations strategy is not available for contrastive learning branch!")
+
+    if (args.dataset == 'inat'):
+        val_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        txt_train = f'../dataset/iNaturalist18/iNaturalist18_train.txt'
+        txt_val = f'../dataset/iNaturalist18/iNaturalist18_val.txt'
+        val_dataset = INaturalist(
+            root=args.data,
+            txt=txt_val,
+            transform=val_transform, train=False,args=args
+        )
+
+        train_dataset = INaturalist(
+                root=args.data,
+                txt=txt_train,
+                args=args,
+                transform=transform_train
+            )
+    elif args.dataset == 'imagenet':
+        val_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        txt_val = f'../dataset/ImageNet_LT/ImageNet_LT_test.txt'
+        txt_train = f'../dataset/ImageNet_LT/ImageNet_LT_train.txt'
+        train_dataset = ImageNetLT(
+                root=args.data,
+                args=args,
+                txt=txt_train,
+                transform=transform_train)
+        val_dataset = ImageNetLT(
+            root=args.data,
+            txt=txt_val,
+            transform=val_transform, train=False,args=args)
+
+    elif args.dataset == 'cifar10':
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        val_dataset = IMBALANCECIFAR10(root=args.data, args=args,
+                                       transform=val_transform,
+                                       train=False, imb_factor=1,download=True)
+        train_dataset = IMBALANCECIFAR10(
+                root=args.data, args=args,download=True,
+                imb_factor=args.imb_factor,
+                transform=transform_train)
+    elif args.dataset == 'Places_LT':
+        val_transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        txt_val = f'../dataset/Places_LT/Places_LT_val.txt'
+        txt_train = f'../dataset/Places_LT/Places_LT_train.txt'
+        train_dataset = PlacesLT(
+                root=args.data,
+                args=args,
+                txt=txt_train,
+                transform=transform_train)
+        val_dataset = PlacesLT(
+            root=args.data,
+            txt=txt_val,
+            transform=val_transform, train=False,args=args)
+    else:
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        val_dataset = IMBALANCECIFAR100(root=args.data, args=args,
+                                        download=True,
+                                        transform=val_transform,
+                                        train=False, imb_factor=1)
+        train_dataset = IMBALANCECIFAR100(
+                root=args.data, args=args,
+                download=True,
+                imb_factor=args.imb_factor,
+                transform=transform_train)
+
+    cls_num_list = train_dataset.cls_num_list
+    args.cls_num = len(cls_num_list)
+    print(len(cls_num_list))
+    train_sampler = None
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True)
+
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True)
+
+    criterion_scl = OFBDContrastiveLoss(cls_num_list, args.temp).cuda(args.gpu)
+    criterion_ce = OFBDLogitAdjustLoss(cls_num_list, tau=args.tau).cuda(args.gpu)
+    criterion_ce_cutmix = OFBDCutMixLoss(cls_num_list, args.tau).cuda(args.gpu)
+
+    if args.reload:
+        if (args.dataset == 'inat'):
+            txt_test = f'../dataset/iNaturalist18/iNaturalist18_val.txt'
+            test_dataset = INaturalist(
+                root=args.data,
+                txt=txt_test,
+                transform=val_transform, train=False,args=args)
+        elif args.dataset == 'imagenet':
+            txt_test = f'../dataset/ImageNet_LT/ImageNet_LT_test.txt'
+            test_dataset = ImageNetLT(
+                root=args.data,
+                txt=txt_test,
+                transform=val_transform, train=False,args=args)
+        elif args.dataset == 'cifar10':
+            test_dataset = IMBALANCECIFAR10(root=args.data, args=args, transform=val_transform, train=False,
+                                            imb_factor=1,download=True)
+        elif args.dataset == 'Places_LT':
+            txt_train = f'../dataset/Places_LT/Places_LT_val.txt'
+
+            test_dataset = PlacesLT(
+                root=args.data,
+                txt=txt_val,
+                transform=val_transform, train=False,args=args)
+
+        else:
+            test_dataset = IMBALANCECIFAR100(root=args.data, args=args, transform=val_transform, train=False,
+                                             imb_factor=1,
+                                             download=True)
+
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
+        acc1, many, med, few, class_acc = validate_ofbd(train_loader, test_loader, model, criterion_ce, 1, args)
+        print('Prec@1: {:.3f}, Many Prec@1: {:.3f}, Med Prec@1: {:.3f}, Few Prec@1: {:.3f}'
+              .format(acc1, many, med, few,))
+
+        return
+    print("start train")
+    for epoch in range(args.start_epoch, args.epochs):
+        adjust_lr(optimizer, epoch, args)
+        ce_loss_all,scl_loss_all,top1,loss=train_ofbd(train_loader, model, criterion_ce, criterion_ce_cutmix, criterion_scl, optimizer,
+              epoch, args,
+              logger_run, cls_num_list)
+        if paper_selector_ref is not None:
+            paper_selector_ref.load_state_dict(paper_selector.state_dict())
+            paper_selector_ref.eval()
+        # evaluate on validation set
+        acc1, many, med, few, class_acc = validate_ofbd(train_loader, val_loader, model, criterion_ce, epoch, args,
+                                             )
+        if (args.logger == "neptune"):
+            logger_run["few_acc"].log(few,step=epoch)
+            logger_run["val_acc"].log(acc1,step=epoch)
+            logger_run["many_acc"].log(many,step=epoch)
+            logger_run["median_acc"].log(med,step=epoch)
+            logger_run["CE_loss/train"].log(ce_loss_all, step=epoch, )
+            logger_run["SCL_loss/train"].log(scl_loss_all, step=epoch)
+            logger_run["train_acc"].log(top1, step=epoch)
+            logger_run["train_loss"].log(loss, step=epoch)
+        # remember best acc@1 and save checkpoint
+        is_best = acc1 > best_acc1
+        best_acc1 = max(acc1, best_acc1)
+        if is_best:
+            best_many = many
+            best_med = med
+            best_few = few
+            best_class_acc = class_acc
+            if(logger_run!=None):
+                logger_run["few_acc_top1"].log(best_few,step=epoch)
+                logger_run["val_acc_top1"].log(best_acc1,step=epoch)
+                logger_run["many_acc_top1"].log(best_many,step=epoch)
+                logger_run["median_acc_top1"].log(best_med,step=epoch)
+            print(
+                'Best Prec@1: {:.3f}, Many Prec@1: {:.3f}, Med Prec@1: {:.3f}, Few Prec@1: {:.3f}'.format(
+                    best_acc1,
+                    best_many,
+                    best_med,
+                    best_few,
+                    ))
+        save_ofbd_checkpoint(args, {
+            'epoch': epoch + 1,
+            'arch': args.arch,
+            'state_dict': model.state_dict(),
+            'best_acc1': best_acc1,
+            'optimizer': optimizer.state_dict(),
+        }, is_best)
+
+
+# 初始化论文的背景混合器
+bg_mixer = OFBDMixupModule()
+
+
+def train_ofbd(train_loader, model, criterion_ce, criterion_ce_cutmix, criterion_scl, optimizer, epoch,
+          args,
+          logger_run, cls_num_list):
+    batch_time = AverageMeter('Time', ':6.3f')
+    ce_loss_all = AverageMeter('CE_Loss', ':.4e')
+    scl_loss_all = AverageMeter('SCL_Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    end = time.time()
+
+    model.train()
+    for i, data in enumerate(train_loader):
+        sample_A, sample_B, target_A, target_B = data  # !Modified: n_views args testing
+        batch_size = target_A.shape[0]
+        target_A, target_B = target_A.cuda(), target_B.cuda()
+        # cutmix
+        sample_A[0], sample_A[1], sample_A[2], = sample_A[0].cuda(), sample_A[1].cuda(), sample_A[2].cuda()
+        sample_B[0], sample_B[1], sample_B[2], = sample_B[0].cuda(), sample_B[1].cuda(), sample_B[2].cuda()
+        lam = np.random.beta(1, 1)
+        rand_index = torch.randperm(sample_B[0].size()[0]).cuda()
+        r = np.random.rand(1)
+        paper_selector_loss = None
+
+        if r < args.cutmix_prob:
+            target_a = target_A
+            target_b = target_B[rand_index]
+            ta = torch.nn.functional.one_hot(target_a, num_classes=args.num_classes).float()
+            tb = torch.nn.functional.one_hot(target_b, num_classes=args.num_classes).float()
+
+            # ====================================================================
+            # 1. 前端物理提纯：利用 IASEM 提取图 B (背景提供者) 的能量雷达
+            # ====================================================================
+            model.eval()
+            with torch.no_grad():
+                _ = model(sample_B[0][rand_index])
+                if isinstance(model, torch.nn.DataParallel):
+                    energy_map = model.module.last_soft_weights.clone()
+                else:
+                    energy_map = model.last_soft_weights.clone()
+            model.train()
+
+            # ====================================================================
+            # 2. 能量制导：锁定图 B 的绝对前景质心
+            # ====================================================================
+            B_dim, _, H_map, W_map = energy_map.shape
+            energy_map_flat = energy_map.view(B_dim, -1)
+            max_idx = energy_map_flat.argmax(dim=1) # 找到能量最高点
+
+            W_img, H_img = sample_A[0].size()[-1], sample_A[0].size()[-2]
+
+            # max_idx % W_map 对应的是 X 轴 (宽)
+            cx_list = ((max_idx % W_map).float() / W_map * W_img).long()
+            # max_idx // W_map 对应的是 Y 轴 (高)
+            cy_list = ((max_idx // W_map).float() / H_map * H_img).long()
+
+            # ====================================================================
+            # 3. 动态硬截断框生成：带随机扰动的前景感知！
+            # ====================================================================
+            cut_rat = np.sqrt(1. - lam)
+            cut_w = np.int64(W_img * cut_rat)
+            cut_h = np.int64(H_img * cut_rat)
+
+            cutmix_mask = torch.zeros_like(sample_A[0]).cuda()
+            for j in range(B_dim):
+                cx, cy = cx_list[j].item(), cy_list[j].item()
+
+                # [理论修复] 引入随机抖动 (Jitter)！
+                # 让切割中心在物体半径内随机漂移，防止网络对固定切块过拟合，恢复遮挡多样性！
+                jitter_x = np.random.randint(-cut_w // 4, cut_w // 4 + 1) if cut_w > 4 else 0
+                jitter_y = np.random.randint(-cut_h // 4, cut_h // 4 + 1) if cut_h > 4 else 0
+
+                cx = np.clip(cx + jitter_x, 0, W_img)
+                cy = np.clip(cy + jitter_y, 0, H_img)
+
+                # 计算最终边界 (bbx对应宽W, bby对应高H)
+                bbx1 = np.clip(cx - cut_w // 2, 0, W_img)
+                bby1 = np.clip(cy - cut_h // 2, 0, H_img)
+                bbx2 = np.clip(cx + cut_w // 2, 0, W_img)
+                bby2 = np.clip(cy + cut_h // 2, 0, H_img)
+
+                # 【工程 Bug 修复】PyTorch 索引必须是 [..., Height(Y), Width(X)] ！！！
+                cutmix_mask[j, :, bby1:bby2, bbx1:bbx2] = 1.0
+
+            # 融合图像：完美保留硬遮挡高频纹理
+            cutmix_sample1 = sample_A[0] * (1. - cutmix_mask) + sample_B[0][rand_index] * cutmix_mask
+
+            # 重新计算真实的面积比例
+            actual_lam = 1.0 - cutmix_mask.mean(dim=(1, 2, 3)).unsqueeze(1) # [B, 1]
+
+            # 双标签保留，喂给后端校准器！
+            target_cutmix = (actual_lam * ta) + ((1. - actual_lam) * tb)
+
+            # Paper RL selector: global M proposals, local-energy prior, and a
+            # residual policy correction.  It replaces only this CutMix view;
+            # the two contrastive views below remain the local-energy branch logic.
+            interval = max(int(round(1.0 / max(args.paper_rl_prob, 1e-12))), 1)
+            if epoch >= args.paper_rl_warmup_epochs and args.paper_rl_prob > 0 and i % interval == 0:
+                cutmix_sample1, target_cutmix, paper_selector_loss, _ = paper_helper.build_cutmix(
+                    model, paper_selector, paper_selector_ref, sample_A[0], sample_B[0][rand_index],
+                    ta, tb, target_a, target_b, lam, 32, True, 0.0, 0.0)
+
+            # ====================================================================
+            # 4. 前向传播与后端语义校准
+            # ====================================================================
+            cutmix_batch_size = cutmix_sample1.size(0)
+            inputs = torch.cat([cutmix_sample1, sample_A[1], sample_A[2]], dim=0).cuda()
+            feat_mlp, logits, centers, uncenters, unfeat = model(inputs)
+
+            uncenters = uncenters[:args.cls_num]
+            logits, _, __ = torch.split(logits, [cutmix_batch_size, batch_size, batch_size], dim=0)
+            f1, f2, f3 = torch.split(feat_mlp, [cutmix_batch_size, batch_size, batch_size], dim=0)
+            unfeat1, unfeat2, unfeat3 = torch.split(unfeat, [cutmix_batch_size, batch_size, batch_size], dim=0)
+
+            if epoch > args.l_d_warm:
+                # 语义校准器接手：在特征空间修正面积标签带来的非线性错位
+                target_lam = ofbd_semantic_targets(
+                    unfeat1, uncenters, target_cutmix, args.scaling_factor, cls_num_list, args.topk
+                )
+                ce_loss = criterion_ce_cutmix(logits, target_lam)
+            else:
+                ce_loss = criterion_ce_cutmix(logits, target_cutmix)
+
+            features = torch.cat([f2.unsqueeze(1), f3.unsqueeze(1)], dim=1)
+            centers = centers[:args.cls_num]
+            scl_loss = criterion_scl(centers, features, target_A)
+
+        else:
+            inputs = torch.cat([sample_A[0], sample_A[1], sample_A[2]], dim=0).cuda()
+
+            feat_mlp, logits, centers, uncenters, unfeat = model(inputs)
+
+            logits, _, __ = torch.split(logits, [batch_size, batch_size, batch_size], dim=0)
+            _, f2, f3 = torch.split(feat_mlp, [batch_size, batch_size, batch_size], dim=0)
+            features = torch.cat([f2.unsqueeze(1), f3.unsqueeze(1)], dim=1)
+
+            centers = centers[:args.cls_num]
+            uncenters = uncenters[:args.cls_num]
+
+            ce_loss = criterion_ce(logits, target_A)
+            scl_loss = criterion_scl(centers, features, target_A)
+
+        loss = args.alpha * ce_loss + args.beta * scl_loss
+
+        ce_loss_all.update(ce_loss.item(), batch_size)
+        scl_loss_all.update(scl_loss.item(), batch_size)
+        # 梯度累积
+        if (args.grad_c):
+            loss = loss / (256 / batch_size)
+            loss.backward()
+            if ((i + 1) % (256 / batch_size) == 0):
+                optimizer.step()
+                optimizer.zero_grad()
+
+
+        else:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        if paper_selector_loss is not None and paper_selector_loss.requires_grad:
+            paper_selector_optimizer.zero_grad()
+            paper_selector_loss.backward()
+            paper_selector_optimizer.step()
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+
+        if i % args.print_freq == 0:
+            output = ('Epoch: [{0}][{1}/{2}] \t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'CE_Loss {ce_loss.val:.4f} ({ce_loss.avg:.4f})\t'
+                      'SCL_Loss {scl_loss.val:.4f} ({scl_loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'loss {loss:.4f}'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                ce_loss=ce_loss_all, scl_loss=scl_loss_all, top1=top1, loss=loss))  # TODO
+            print(output)
+
+
+        ce_loss_all.update(ce_loss.item(), batch_size)
+        scl_loss_all.update(scl_loss.item(), batch_size)
+
+        metric_target = target_A if logits.size(0) == target_A.size(0) else target_A.repeat_interleave(logits.size(0) // target_A.size(0))
+        acc1 = accuracy(logits, metric_target, topk=(1,))
+        top1.update(acc1[0].item(), batch_size)
+
+
+    return  ce_loss_all.avg,scl_loss_all.avg,top1.avg,loss
+
+
+
+def validate_ofbd(train_loader, val_loader, model, criterion_ce, epoch, args, flag='val'):
+    model.eval()
+    batch_time = AverageMeter('Time', ':6.3f')
+    ce_loss_all = AverageMeter('CE_Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    total_logits = torch.empty((0, args.cls_num)).cuda()
+    total_labels = torch.empty(0, dtype=torch.long).cuda()
+
+    end = time.time()
+    for i, data in enumerate(val_loader):
+        inputs, targets = data
+        inputs, targets = inputs.cuda(), targets.cuda()
+        batch_size = targets.size(0)
+        with torch.no_grad():
+            feat_mlp, logits, centers, _, __ = model(inputs)
+
+        # 下面这些统计不需要梯度
+        with torch.no_grad():
+            ce_loss = criterion_ce(logits, targets)
+
+            total_logits = torch.cat((total_logits, logits.detach()))
+            total_labels = torch.cat((total_labels, targets.detach()))
+
+            acc1 = accuracy(logits, targets, topk=(1,))
+            ce_loss_all.update(ce_loss.item(), batch_size)
+            top1.update(acc1[0].item(), batch_size)
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+    output = ('Test: [{0}/{1}]\t'
+              'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+              'CE_Loss {ce_loss.val:.4f} ({ce_loss.avg:.4f})\t'
+              'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+              .format(
+        i, len(val_loader), batch_time=batch_time, ce_loss=ce_loss_all, top1=top1,
+    ))
+    print(output)
+
+    probs, preds = F.softmax(total_logits, dim=1).max(dim=1)
+    many_acc_top1, median_acc_top1, low_acc_top1, class_acc = shot_acc(
+        preds, total_labels, train_loader, acc_per_cls=False
+    )
+    return top1.avg, many_acc_top1, median_acc_top1, low_acc_top1, class_acc
+
+
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = np.int64(W * cut_rat)
+    cut_h = np.int64(H * cut_rat)
+
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
+
+
+def save_ofbd_checkpoint(args, state, is_best):
+    filename = os.path.join(args.root_log, args.store_name,'OFBD_ckpt.pth.tar')
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, filename.replace('pth.tar', 'best.pth.tar'))
+
+
+
+def adjust_lr(optimizer, epoch, args):
+    """Decay the learning rate based on schedule"""
+    lr = args.lr
+    if epoch < args.warmup_epochs:
+        lr = lr / args.warmup_epochs * (epoch + 1)
+    elif args.cos:  # cosine lr schedule
+        lr *= 0.5 * (1. + math.cos(math.pi * (epoch - args.warmup_epochs + 1) / (args.epochs - args.warmup_epochs + 1)))
+    else:  # stepwise lr schedule
+        for milestone in args.schedule:
+            lr *= 0.1 if epoch >= milestone else 1.
+            # lr *= 0.1 if epoch == milestone else 1.
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred)).contiguous()
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
+
+
+def ofbd_semantic_targets(feature, center, target, scaling_factor,cls,k):
+    #get the scaling factor omega
+    scaling_factor=scaling_factor[0]/scaling_factor[1]
+    #get N
+    cls_num_list = torch.cuda.FloatTensor(cls)
+    #sum(log(N_i))
+    weight=torch.log((cls_num_list*target).sum(1))
+    #N /sum(log(N_i))
+    weight=(weight/(torch.log(cls_num_list).sum())).reshape(-1,1)
+    target_de = target.detach()
+    center_de = center.detach()
+    feature_de = feature.detach()
+    # get the euclidean distance
+    sim = torch.sqrt(torch.sum((feature_de[:, None, :] - center_de) ** 2, dim=2))
+    sim = 1 / sim
+    # top K
+    indices_to_remove = sim < torch.topk(sim, k)[0][..., -1, None]
+    sim[indices_to_remove] = 0
+    final_sim = sim
+    # normlaization
+    label = F.normalize(final_sim, p=1, dim=1)
+    label = (weight*scaling_factor) * label + (1 - weight*scaling_factor) * target_de
+    return label
+
+
+if __name__ == '__main__':
+    main()
+    # center=torch.tensor([[1.21,1],[1,4],[2,5],[3,5]])
+    # target=torch.tensor([0,2,0,1,2])
+    # feature=torch.tensor([[1.1,1],[2,6],[2,50],[33,5],[34,1]])
+    # target=F.one_hot(target,4)
+    # print(ofbd_semantic_targets(feature,center,target,0.01,[100,10,5,1],2))
+    # targetA = torch.tensor([0, 2, 0, 3])
+    # targetB = torch.tensor([1, 0, 2, 1])
+    # lam=0.1
+    # center = torch.tensor([[1.21, 1], [1, 4], [2, 5], [3, 5]])
+    # print(get_distance_cutmix_5(center, targetA,targetB,lam, 0.01, [9, 6, 3, 2]))
+    exit(0)

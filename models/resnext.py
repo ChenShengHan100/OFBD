@@ -4,6 +4,8 @@ import torch.nn as nn
 from typing import Type, Any, Callable, Union, List, Optional
 import torch.nn.functional as F
 
+from models.resnet32 import OFBDAggregationHead
+
 
 class NormedLinear(nn.Module):
 
@@ -222,7 +224,7 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
+    def forward_features(self, x: Tensor) -> Tensor:
         # See note [TorchScript super()]
         x = self.conv1(x)
         x = self.bn1(x)
@@ -234,11 +236,12 @@ class ResNet(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
 
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
-        # x = self.fc(x)
-
         return x
+
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        x = self.forward_features(x)
+        x = self.avgpool(x)
+        return torch.flatten(x, 1)
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
@@ -281,11 +284,17 @@ model_dict = {
     'resnext50': [resnext50, 2048]
 }
 
-class BCLModel(nn.Module):
-    def __init__(self, num_classes=1000, name='resnet50', head='mlp', use_norm=True, feat_dim=1024):
-        super(BCLModel, self).__init__()
+class OFBDModel(nn.Module):
+    def __init__(self, num_classes=1000, name='resnet50', head='mlp', use_norm=True, feat_dim=1024,
+                 use_bfr=False, bg_scale=0.5):
+        super(OFBDModel, self).__init__()
         model_fun, dim_in = model_dict[name]
         self.encoder = model_fun()
+        self.use_bfr = use_bfr
+        if use_bfr:
+            self.aggr_head = OFBDAggregationHead(channels=dim_in, max_floor=0.55,
+                                                init_temp=0.1, use_simam=True,
+                                                use_bge=True, bg_scale=bg_scale)
         if head == 'mlp':
             self.head = nn.Sequential(nn.Linear(dim_in, dim_in), nn.BatchNorm1d(dim_in), nn.ReLU(inplace=True),
                                       nn.Linear(dim_in, feat_dim))
@@ -300,11 +309,23 @@ class BCLModel(nn.Module):
         self.head_fc = nn.Sequential(nn.Linear(dim_in, dim_in), nn.BatchNorm1d(dim_in), nn.ReLU(inplace=True),
                                    nn.Linear(dim_in, feat_dim))
 
-    def forward(self, x):
-        feat = self.encoder(x)
+    def forward(self, x, return_aux=False):
+        fmap_raw = self.encoder.forward_features(x)
+        if self.use_bfr:
+            feat, fmap_refined, fg_mask, _bg_mask, _fg_feat, _bg_feat = self.aggr_head(fmap_raw)
+        else:
+            fmap_refined = fmap_raw
+            feat = F.adaptive_avg_pool2d(fmap_raw, 1).flatten(1)
+            # A deterministic energy map keeps the foreground-CutMix interface
+            # available for the no-BFR ablation without adding learnable modules.
+            energy = fmap_raw.norm(dim=1, keepdim=True)
+            fg_mask = energy / energy.amax(dim=(2, 3), keepdim=True).clamp_min(1e-6)
+        self.last_soft_weights = fg_mask.detach()
         feat_mlp = F.normalize(self.head(feat), dim=1)
         logits = self.fc(feat)
         centers_logits = F.normalize(self.head_fc(self.fc.weight.T), dim=1)
         unfn_centers=self.head_fc(self.fc.weight.T)
         unfn_feat=self.head(feat)
+        if return_aux:
+            return feat_mlp, logits, centers_logits, unfn_centers, unfn_feat, fmap_raw, fg_mask
         return feat_mlp, logits, centers_logits, unfn_centers, unfn_feat

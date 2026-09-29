@@ -4,9 +4,9 @@ import torch
 import torch.nn as nn
 
 
-class BalSCL(nn.Module):
+class OFBDContrastiveLoss(nn.Module):
     def __init__(self, cls_num_list=None, temperature=0.1):
-        super(BalSCL, self).__init__()
+        super(OFBDContrastiveLoss, self).__init__()
         self.temperature = temperature
         self.cls_num_list = cls_num_list
 
@@ -19,7 +19,9 @@ class BalSCL(nn.Module):
         targets = targets.contiguous().view(-1, 1)
         targets_centers = torch.arange(len(self.cls_num_list), device=device).view(-1, 1)
         targets = torch.cat([targets.repeat(2, 1), targets_centers], dim=0)
-        batch_cls_count = torch.eye(len(self.cls_num_list))[targets].sum(dim=0).squeeze()
+        device = targets.device
+        # 在创建 eye 矩阵时指定设备
+        batch_cls_count = torch.eye(len(self.cls_num_list), device=device)[targets].sum(dim=0).squeeze()
 
         mask = torch.eq(targets[:2 * batch_size], targets.T).float().to(device)
         logits_mask = torch.scatter(

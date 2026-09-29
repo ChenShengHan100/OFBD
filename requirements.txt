@@ -1,0 +1,8 @@
+# Versions present in the OFBD training environment (Python 3.9).
+# Install a CUDA-compatible PyTorch build for your machine before training.
+torch==2.8.0
+torchvision==0.23.0
+numpy==2.0.2
+Pillow==11.3.0
+neptune==1.14.0.post2
+matplotlib==3.9.4

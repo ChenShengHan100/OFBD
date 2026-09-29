@@ -51,14 +51,14 @@ class ImageNetLT(Dataset):
                 B_label = random.randint(0, self.num_classes - 1)
                 B_index = random.choice(self.class_data[B_label])
                 B_path = self.img_path[B_index]
-
+                with open(B_path, 'rb') as f:
+                    sample_B = Image.open(f).convert('RGB')
 
 
         with open(A_path, 'rb') as f:
             sample_A = Image.open(f).convert('RGB')
 
-        with open(B_path, 'rb') as f:
-            sample_B = Image.open(f).convert('RGB')
+
         if self.transform is not None:
             if self.train:
                 sample_A1 = self.transform[0](sample_A)
@@ -70,6 +70,3 @@ class ImageNetLT(Dataset):
                 return [sample_A1, sample_A2, sample_A3], [sample_B1, sample_B2, sample_B3], A_label, B_label  # , index
             else:
                 return self.transform(sample_A), A_label
-
-
-

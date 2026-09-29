@@ -1,0 +1,36 @@
+[submodule "third_party/CoordAttention"]
+	path = third_party/CoordAttention
+	url = https://github.com/houqb/CoordAttention.git
+	ignore = untracked
+[submodule "third_party/KeepAugment_Pytorch"]
+	path = third_party/KeepAugment_Pytorch
+	url = https://github.com/cjf8899/KeepAugment_Pytorch.git
+	ignore = untracked
+[submodule "third_party/PuzzleMix"]
+	path = third_party/PuzzleMix
+	url = https://github.com/snu-mllab/PuzzleMix.git
+	ignore = untracked
+[submodule "third_party/ResizeMix"]
+	path = third_party/ResizeMix
+	url = https://github.com/JieQin-AI/ResizeMix.git
+	ignore = untracked
+[submodule "third_party/SaliencyMix"]
+	path = third_party/SaliencyMix
+	url = https://github.com/afm-shahab-uddin/SaliencyMix.git
+	ignore = untracked
+[submodule "third_party/SnapMix"]
+	path = third_party/SnapMix
+	url = https://github.com/Shaoli-Huang/SnapMix.git
+	ignore = untracked
+[submodule "third_party/attention-module"]
+	path = third_party/attention-module
+	url = https://github.com/Jongchan/attention-module.git
+	ignore = untracked
+[submodule "third_party/attentive_cutmix"]
+	path = third_party/attentive_cutmix
+	url = https://github.com/xden2331/attentive_cutmix.git
+	ignore = untracked
+[submodule "third_party/triplet-attention"]
+	path = third_party/triplet-attention
+	url = https://github.com/landskape-ai/triplet-attention.git
+	ignore = untracked

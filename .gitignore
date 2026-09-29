@@ -1,0 +1,43 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Local credentials and editor files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+.DS_Store
+
+# Downloaded datasets; retain dataset loaders and split lists
+/dataset/cifar-10-batches-py/
+/dataset/cifar-100-python/
+/dataset/ImageNet2012/
+/dataset/train_val2018/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Training outputs and checkpoints
+/log/
+/logs/
+/log_sup/
+/checkpoints/
+/outputs/
+/runs/
+*.log
+*.pth
+*.pt
+*.ckpt
+events.out.tfevents.*
+.neptune/
+
+# Local comparison repositories and their downloaded datasets
+/exp/
